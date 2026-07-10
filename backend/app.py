@@ -40,8 +40,6 @@ def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",  # avoid /dev/shm OOM on small containers (e.g. Render free tier)
-                "--single-process",
-                "--no-zygote",
             ],
         )
         context = browser.new_context(
