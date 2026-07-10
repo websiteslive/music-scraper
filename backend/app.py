@@ -16,7 +16,14 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PLAYLIST_ID_RE = re.compile(r"playlist[/:]([a-zA-Z0-9]+)")
-TRACKLIST_ROW = "[data-testid='tracklist-row']"
+# The embed player uses a different DOM than the full web player, so we try
+# several candidate selectors and use whichever one actually matches.
+TRACKLIST_ROW_CANDIDATES = [
+    "[data-testid='tracklist-row']",
+    "[data-testid='track-row']",
+    "[data-testid='playlist-tracklist'] > div > div",
+    "div[role='row']",
+]
 
 
 def extract_playlist_id(url: str) -> str | None:
@@ -59,7 +66,7 @@ def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit
     When debug=True, always captures a screenshot + HTML snippet of the page
     state (not just on failure) so the caller can inspect what Spotify served.
     """
-    url = f"https://open.spotify.com/playlist/{playlist_id}"
+    url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
     tracks = []
     seen_hrefs = set()
     playlist_name = None
@@ -93,9 +100,16 @@ def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit
                 except Exception:
                     pass
 
-            try:
-                page.wait_for_selector(TRACKLIST_ROW, timeout=15000)
-            except PlaywrightTimeoutError:
+            matched_selector = None
+            for selector in TRACKLIST_ROW_CANDIDATES:
+                try:
+                    page.wait_for_selector(selector, timeout=5000)
+                    matched_selector = selector
+                    break
+                except PlaywrightTimeoutError:
+                    continue
+
+            if matched_selector is None:
                 # Capture debug info regardless of the debug flag here, since this
                 # is exactly the failure case we need visibility into. It's only
                 # attached to the response if the caller asked for debug mode.
@@ -117,7 +131,7 @@ def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit
 
             stall_count = 0
             for _ in range(max_scroll_attempts):
-                rows = page.locator(TRACKLIST_ROW)
+                rows = page.locator(matched_selector)
                 count = rows.count()
                 new_this_pass = 0
 
