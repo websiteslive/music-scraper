@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import base64
 import logging
 
 from flask import Flask, request, jsonify
@@ -23,16 +24,46 @@ def extract_playlist_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit: int = 4):
+def capture_debug_info(page) -> dict:
+    """Grabs a screenshot + trimmed HTML of whatever the page is currently
+    showing, so we can tell a login wall / consent screen / captcha / normal
+    tracklist apart when a scrape doesn't behave as expected."""
+    info = {"url": None, "title": None, "screenshot_base64": None, "html_snippet": None}
+    try:
+        info["url"] = page.url
+    except Exception:
+        pass
+    try:
+        info["title"] = page.title()
+    except Exception:
+        pass
+    try:
+        png_bytes = page.screenshot(full_page=False)
+        info["screenshot_base64"] = base64.b64encode(png_bytes).decode("ascii")
+    except Exception as e:
+        info["screenshot_error"] = str(e)
+    try:
+        html = page.content()
+        info["html_snippet"] = html[:8000]  # trimmed, full HTML can be huge
+    except Exception as e:
+        info["html_error"] = str(e)
+    return info
+
+
+def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit: int = 4, debug: bool = False):
     """
     Loads the public Spotify playlist page in a headless browser, scrolls the
     virtualized track list to force every row to mount, and pulls track name,
     artist, and canonical open.spotify.com link out of the rendered DOM.
+
+    When debug=True, always captures a screenshot + HTML snippet of the page
+    state (not just on failure) so the caller can inspect what Spotify served.
     """
     url = f"https://open.spotify.com/playlist/{playlist_id}"
     tracks = []
     seen_hrefs = set()
     playlist_name = None
+    debug_info = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -65,10 +96,19 @@ def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit
             try:
                 page.wait_for_selector(TRACKLIST_ROW, timeout=15000)
             except PlaywrightTimeoutError:
-                raise RuntimeError(
+                # Capture debug info regardless of the debug flag here, since this
+                # is exactly the failure case we need visibility into. It's only
+                # attached to the response if the caller asked for debug mode.
+                debug_info = capture_debug_info(page)
+                err = RuntimeError(
                     "Spotify didn't return a track list for this playlist. "
                     "It may be private, empty, or region-locked."
                 )
+                err.debug_info = debug_info
+                raise err
+
+            if debug:
+                debug_info = capture_debug_info(page)
 
             try:
                 playlist_name = page.locator("h1").first.inner_text(timeout=3000)
@@ -126,11 +166,22 @@ def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit
                 page.mouse.wheel(0, 1600)
                 time.sleep(0.35)
 
+        except RuntimeError:
+            raise
+        except Exception:
+            # Any other unexpected failure — grab debug info too, if requested,
+            # before we lose the page.
+            if debug and debug_info is None:
+                try:
+                    debug_info = capture_debug_info(page)
+                except Exception:
+                    pass
+            raise
         finally:
             context.close()
             browser.close()
 
-    return playlist_name, tracks
+    return playlist_name, tracks, debug_info
 
 
 @app.route("/api/tracks", methods=["POST"])
@@ -138,26 +189,38 @@ def api_tracks():
     data = request.get_json(silent=True) or {}
     playlist_url = data.get("playlist_url", "")
     playlist_id = extract_playlist_id(playlist_url)
+    debug = bool(data.get("debug", False))
 
     if not playlist_id:
         return jsonify({"error": "That doesn't look like a Spotify playlist link."}), 400
 
+    debug_info = None
     try:
-        name, tracks = scrape_playlist(playlist_id)
+        name, tracks, debug_info = scrape_playlist(playlist_id, debug=debug)
     except RuntimeError as e:
-        return jsonify({"error": str(e)}), 502
+        payload = {"error": str(e)}
+        if debug and getattr(e, "debug_info", None):
+            payload["debug"] = e.debug_info
+        return jsonify(payload), 502
     except Exception as e:
         log.exception("Scrape failed")
         return jsonify({"error": f"Scrape failed: {e}"}), 500
 
     if not tracks:
-        return jsonify({"error": "No tracks found — the playlist may be private or empty."}), 404
+        payload = {"error": "No tracks found — the playlist may be private or empty."}
+        if debug and debug_info:
+            payload["debug"] = debug_info
+        return jsonify(payload), 404
 
-    return jsonify({
+    response = {
         "playlist_name": name or "Tracklist",
         "count": len(tracks),
         "tracks": tracks,
-    })
+    }
+    if debug and debug_info:
+        response["debug"] = debug_info
+
+    return jsonify(response)
 
 
 @app.route("/api/health", methods=["GET"])
