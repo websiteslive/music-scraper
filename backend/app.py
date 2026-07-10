@@ -1,12 +1,11 @@
 import os
 import re
-import time
-import base64
+import json
 import logging
 
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("unspooler")
@@ -16,14 +15,18 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PLAYLIST_ID_RE = re.compile(r"playlist[/:]([a-zA-Z0-9]+)")
-# The embed player uses a different DOM than the full web player, so we try
-# several candidate selectors and use whichever one actually matches.
-TRACKLIST_ROW_CANDIDATES = [
-    "[data-testid='tracklist-row']",
-    "[data-testid='track-row']",
-    "[data-testid='playlist-tracklist'] > div > div",
-    "div[role='row']",
-]
+NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+    re.DOTALL,
+)
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def extract_playlist_id(url: str) -> str | None:
@@ -31,169 +34,65 @@ def extract_playlist_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def capture_debug_info(page) -> dict:
-    """Grabs a screenshot + trimmed HTML of whatever the page is currently
-    showing, so we can tell a login wall / consent screen / captcha / normal
-    tracklist apart when a scrape doesn't behave as expected."""
-    info = {"url": None, "title": None, "screenshot_base64": None, "html_snippet": None}
-    try:
-        info["url"] = page.url
-    except Exception:
-        pass
-    try:
-        info["title"] = page.title()
-    except Exception:
-        pass
-    try:
-        png_bytes = page.screenshot(full_page=False)
-        info["screenshot_base64"] = base64.b64encode(png_bytes).decode("ascii")
-    except Exception as e:
-        info["screenshot_error"] = str(e)
-    try:
-        html = page.content()
-        info["html_snippet"] = html[:8000]  # trimmed, full HTML can be huge
-    except Exception as e:
-        info["html_error"] = str(e)
-    return info
-
-
-def scrape_playlist(playlist_id: str, max_scroll_attempts: int = 60, stall_limit: int = 4, debug: bool = False):
+def scrape_playlist(playlist_id: str, debug: bool = False):
     """
-    Loads the public Spotify playlist page in a headless browser, scrolls the
-    virtualized track list to force every row to mount, and pulls track name,
-    artist, and canonical open.spotify.com link out of the rendered DOM.
-
-    When debug=True, always captures a screenshot + HTML snippet of the page
-    state (not just on failure) so the caller can inspect what Spotify served.
+    Fetches Spotify's embeddable playlist page and pulls the playlist name +
+    full track list out of its __NEXT_DATA__ JSON blob — the same data
+    Spotify's own frontend uses to render the page. No browser needed.
     """
     url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
-    tracks = []
-    seen_hrefs = set()
-    playlist_name = None
     debug_info = None
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",  # avoid /dev/shm OOM on small containers (e.g. Render free tier)
-            ],
+    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
+
+    if debug:
+        debug_info = {
+            "url": url,
+            "status_code": resp.status_code,
+            "html_snippet": resp.text[:8000],
+        }
+
+    if resp.status_code != 200:
+        err = RuntimeError(
+            "Spotify didn't return a track list for this playlist. "
+            "It may be private, empty, or region-locked."
         )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 1800},
+        err.debug_info = debug_info
+        raise err
+
+    match = NEXT_DATA_RE.search(resp.text)
+    if not match:
+        err = RuntimeError(
+            "Spotify didn't return a track list for this playlist. "
+            "It may be private, empty, or region-locked."
         )
-        page = context.new_page()
+        err.debug_info = debug_info
+        raise err
 
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    try:
+        data = json.loads(match.group(1))
+        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        err = RuntimeError(
+            "Spotify didn't return a track list for this playlist. "
+            "It may be private, empty, or region-locked."
+        )
+        err.debug_info = debug_info
+        raise err
 
-            # Dismiss the cookie/consent banner if present, it can intercept clicks/scrolls.
-            for selector in ["button:has-text('Accept')", "button:has-text('Decline')"]:
-                try:
-                    page.locator(selector).first.click(timeout=2000)
-                    break
-                except Exception:
-                    pass
+    playlist_name = entity.get("title") or entity.get("name")
+    track_list = entity.get("trackList") or []
 
-            matched_selector = None
-            for selector in TRACKLIST_ROW_CANDIDATES:
-                try:
-                    page.wait_for_selector(selector, timeout=5000)
-                    matched_selector = selector
-                    break
-                except PlaywrightTimeoutError:
-                    continue
-
-            if matched_selector is None:
-                # Capture debug info regardless of the debug flag here, since this
-                # is exactly the failure case we need visibility into. It's only
-                # attached to the response if the caller asked for debug mode.
-                debug_info = capture_debug_info(page)
-                err = RuntimeError(
-                    "Spotify didn't return a track list for this playlist. "
-                    "It may be private, empty, or region-locked."
-                )
-                err.debug_info = debug_info
-                raise err
-
-            if debug:
-                debug_info = capture_debug_info(page)
-
-            try:
-                playlist_name = page.locator("h1").first.inner_text(timeout=3000)
-            except Exception:
-                playlist_name = None
-
-            stall_count = 0
-            for _ in range(max_scroll_attempts):
-                rows = page.locator(matched_selector)
-                count = rows.count()
-                new_this_pass = 0
-
-                for i in range(count):
-                    row = rows.nth(i)
-                    try:
-                        link_el = row.locator("a[data-testid='internal-track-link']").first
-                        href = link_el.get_attribute("href", timeout=1000)
-                    except Exception:
-                        href = None
-
-                    if not href or href in seen_hrefs:
-                        continue
-                    seen_hrefs.add(href)
-                    new_this_pass += 1
-
-                    try:
-                        name = link_el.inner_text(timeout=1000).strip()
-                    except Exception:
-                        name = "Unknown title"
-
-                    artist_names = []
-                    try:
-                        artist_links = row.locator("a[href*='/artist/']")
-                        for j in range(artist_links.count()):
-                            t = artist_links.nth(j).inner_text(timeout=1000).strip()
-                            if t:
-                                artist_names.append(t)
-                    except Exception:
-                        pass
-
-                    full_url = href if href.startswith("http") else f"https://open.spotify.com{href}"
-                    tracks.append({
-                        "name": name,
-                        "artists": ", ".join(artist_names) if artist_names else "Unknown artist",
-                        "link": full_url,
-                    })
-
-                if new_this_pass == 0:
-                    stall_count += 1
-                    if stall_count >= stall_limit:
-                        break
-                else:
-                    stall_count = 0
-
-                page.mouse.wheel(0, 1600)
-                time.sleep(0.35)
-
-        except RuntimeError:
-            raise
-        except Exception:
-            # Any other unexpected failure — grab debug info too, if requested,
-            # before we lose the page.
-            if debug and debug_info is None:
-                try:
-                    debug_info = capture_debug_info(page)
-                except Exception:
-                    pass
-            raise
-        finally:
-            context.close()
-            browser.close()
+    tracks = []
+    for t in track_list:
+        uri = t.get("uri", "")
+        track_id = uri.split(":")[-1] if uri else None
+        link = f"https://open.spotify.com/track/{track_id}" if track_id else ""
+        tracks.append({
+            "name": t.get("title") or "Unknown title",
+            "artists": t.get("subtitle") or "Unknown artist",
+            "link": link,
+        })
 
     return playlist_name, tracks, debug_info
 
@@ -208,7 +107,6 @@ def api_tracks():
     if not playlist_id:
         return jsonify({"error": "That doesn't look like a Spotify playlist link."}), 400
 
-    debug_info = None
     try:
         name, tracks, debug_info = scrape_playlist(playlist_id, debug=debug)
     except RuntimeError as e:
@@ -216,6 +114,9 @@ def api_tracks():
         if debug and getattr(e, "debug_info", None):
             payload["debug"] = e.debug_info
         return jsonify(payload), 502
+    except requests.RequestException as e:
+        log.exception("Request to Spotify failed")
+        return jsonify({"error": f"Couldn't reach Spotify: {e}"}), 502
     except Exception as e:
         log.exception("Scrape failed")
         return jsonify({"error": f"Scrape failed: {e}"}), 500
