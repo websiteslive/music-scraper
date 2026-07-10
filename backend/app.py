@@ -87,7 +87,7 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
     for t in track_list:
         uri = t.get("uri", "")
         track_id = uri.split(":")[-1] if uri else None
-        link = f"https://open.spotify.com/track/{track_id}" if track_id else ""
+        link = f"https://open.spotify.com/embede/track/{track_id}" if track_id else ""
         tracks.append({
             "name": t.get("title") or "Unknown title",
             "artists": t.get("subtitle") or "Unknown artist",
