@@ -168,10 +168,8 @@ def enrich_tracks_with_metadata(tracks: list, max_workers: int = METADATA_FETCH_
 
 def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> dict:
     """
-    Uses yt-dlp + ffmpeg to fetch the full song from YouTube. Requires both
-    installed on the server (on Render, that means a Dockerfile — the native/
-    nixpacks Python runtime does NOT have ffmpeg by default). Called on-demand
-    for a single track now, never for a whole playlist at once.
+    Uses yt-dlp to natively fetch and extract the audio. 
+    This avoids raw ffmpeg connections that trigger YouTube's IP blocks.
     """
     output_filename = os.path.join(OUTPUT_DIR, f"{track_id}.mp3")
 
@@ -179,25 +177,35 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
     search_query = f"ytsearch1:{track_name} {track_artist} full song official audio"
+    
     try:
-        ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-g", search_query]
-        stream_url = subprocess.check_output(ytdlp_cmd, text=True, timeout=60).strip()
+        # Let yt-dlp handle the download natively to bypass bot protections
+        ytdlp_cmd = [
+            "yt-dlp",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "0", # Best quality
+            "-o", output_filename,
+            search_query
+        ]
+        
+        # NOTE: If Render still blocks you, you may need to add a cookies file:
+        # ytdlp_cmd.extend(["--cookies", "cookies.txt"])
 
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", stream_url, "-c:a", "libmp3lame", output_filename]
-        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        subprocess.run(ytdlp_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         check=True, timeout=120)
 
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
     except FileNotFoundError as e:
         log.error("Missing system dependency for %s: %s", track_id, e)
-        return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed on the server): {e}"}
+        return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed): {e}"}
     except subprocess.TimeoutExpired:
         log.error("Timed out generating audio for %s", track_id)
-        return {"url": None, "error": "Timed out reaching YouTube (likely rate-limited/blocked from this server's IP)."}
+        return {"url": None, "error": "Timed out reaching YouTube."}
     except subprocess.CalledProcessError:
         log.error("Subprocess failed for %s", track_id)
-        return {"url": None, "error": "Process failed — YouTube rate limit/block from this server's IP is the most common cause."}
+        return {"url": None, "error": "Process failed — YouTube block."}
     except Exception as e:
         log.error("Failed to generate custom audio file for %s: %s", track_id, e)
         return {"url": None, "error": str(e)}
