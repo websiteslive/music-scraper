@@ -4,11 +4,9 @@ import io
 import json
 import logging
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import requests
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+import requests
 
 try:
     from PIL import Image
@@ -20,6 +18,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("unspooler")
 
 app = Flask(__name__)
+# Enable CORS globally to prevent browser CORS blocks ("Failed to fetch")
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PLAYLIST_ID_RE = re.compile(r"playlist[/:]([a-zA-Z0-9]+)")
@@ -42,7 +41,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def scrape_youtube_video_id(query: str) -> str:
     """
-    Performs a lightweight, block-resistant pure HTML search on YouTube
+    Performs a lightweight, block-resistant HTML search on YouTube
     to find the top video ID for a track.
     """
     try:
@@ -72,7 +71,7 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- TIER 1: SpotifyDown API (Fastest & most reliable) ---
-    if track_id and len(track_id) == 22:  # Valid Spotify Track ID length
+    if track_id and len(track_id) == 22:
         try:
             log.info("Tier 1: Querying SpotifyDown for: %s", track_id)
             api_url = f"https://api.spotifydown.com/download/{track_id}"
@@ -207,8 +206,8 @@ def save_cover_webp(track_id: str, cover_url: str) -> dict:
 @app.route("/api/playlist", methods=["POST"])
 def api_playlist():
     """
-    Accepts a Spotify/YouTube playlist URL, scrapes metadata,
-    and returns metadata list of tracks.
+    Accepts a Spotify playlist URL, scrapes metadata natively,
+    or falls back to the SpotifyDown playlist API if Spotify blocks the scrape.
     """
     data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
@@ -221,71 +220,123 @@ def api_playlist():
         return jsonify({"error": "Invalid Spotify URL."}), 400
 
     playlist_id = match.group(1)
-    scrape_url = f"https://open.spotify.com/playlist/{playlist_id}"
 
-    try:
-        resp = requests.get(scrape_url, headers=REQUEST_HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return jsonify({"error": f"Spotify returned HTTP {resp.status_code}"}), 500
+    # --- METHOD 1: Direct Spotify Scraping (Try embed and standard routes) ---
+    scrape_urls = [
+        f"https://open.spotify.com/embed/playlist/{playlist_id}",
+        f"https://open.spotify.com/playlist/{playlist_id}"
+    ]
 
-        script_match = NEXT_DATA_RE.search(resp.text)
-        if not script_match:
-            return jsonify({"error": "Could not extract playlist data from HTML structure."}), 500
-
-        next_json = json.loads(script_match.group(1))
-        
-        # Access nested elements in NEXT_DATA layout safely
+    for scrape_url in scrape_urls:
         try:
-            page_props = next_json["props"]["pageProps"]
-            state = page_props.get("state") or page_props.get("fallback") or {}
-            playlist_key = next(k for k in state.keys() if "playlist" in k)
-            playlist_obj = state[playlist_key]["data"]["playlistV2"]
-        except Exception:
-            return jsonify({"error": "Parsing layout elements failed."}), 500
+            log.info("Attempting to scrape Spotify URL: %s", scrape_url)
+            resp = requests.get(scrape_url, headers=REQUEST_HEADERS, timeout=15)
+            if resp.status_code == 200:
+                script_match = NEXT_DATA_RE.search(resp.text)
+                if script_match:
+                    next_json = json.loads(script_match.group(1))
+                    page_props = next_json.get("props", {}).get("pageProps", {})
+                    state = page_props.get("state") or page_props.get("fallback") or {}
+                    
+                    playlist_key = None
+                    for k in state.keys():
+                        if "playlist" in k.lower():
+                            playlist_key = k
+                            break
+                    
+                    if playlist_key:
+                        playlist_obj = state[playlist_key]["data"]["playlistV2"]
+                        p_name = playlist_obj.get("name", "Untitled Tape")
+                        p_desc = playlist_obj.get("description", "")
+                        p_author = playlist_obj.get("ownerV2", {}).get("name", "Unknown Artist")
 
-        p_name = playlist_obj.get("name", "Untitled Tape")
-        p_desc = playlist_obj.get("description", "")
-        p_author = playlist_obj.get("ownerV2", {}).get("name", "Unknown Artist")
+                        tracks_items = playlist_obj.get("content", {}).get("items", [])
+                        tracks = []
+                        for index, item in enumerate(tracks_items):
+                            item_data = item.get("itemV2", {}).get("data", {})
+                            if not item_data:
+                                continue
 
-        tracks_items = playlist_obj.get("content", {}).get("items", [])
-        tracks = []
-        for index, item in enumerate(tracks_items):
-            item_data = item.get("itemV2", {}).get("data", {})
-            if not item_data:
-                continue
+                            t_id = item_data.get("id")
+                            t_name = item_data.get("name", "Unknown Track")
+                            
+                            artists_list = item_data.get("artists", {}).get("items", [])
+                            t_artists = ", ".join([a.get("profile", {}).get("name", "Unknown") for a in artists_list])
 
-            t_id = item_data.get("id")
-            t_name = item_data.get("name", "Unknown Track")
-            
-            artists_list = item_data.get("artists", {}).get("items", [])
-            t_artists = ", ".join([a.get("profile", {}).get("name", "Unknown") for a in artists_list])
+                            images_list = item_data.get("albumOfTrack", {}).get("coverArt", {}).get("sources", [])
+                            t_cover = images_list[0].get("url") if images_list else None
 
-            images_list = item_data.get("albumOfTrack", {}).get("coverArt", {}).get("sources", [])
-            t_cover = images_list[0].get("url") if images_list else None
+                            duration_ms = item_data.get("duration", {}).get("totalMillisecondsValue", 0)
+                            t_duration = f"{int(duration_ms / 60000)}:{int((duration_ms % 60000) / 1000):02d}"
 
-            duration_ms = item_data.get("duration", {}).get("totalMillisecondsValue", 0)
-            t_duration = f"{int(duration_ms / 60000)}:{int((duration_ms % 60000) / 1000):02d}"
+                            tracks.append({
+                                "id": t_id or f"track_{index}",
+                                "name": t_name,
+                                "artists": t_artists,
+                                "cover_url": t_cover,
+                                "duration": t_duration
+                            })
 
-            tracks.append({
-                "id": t_id or f"track_{index}",
-                "name": t_name,
-                "artists": t_artists,
-                "cover_url": t_cover,
-                "duration": t_duration
-            })
+                        log.info("Direct scraping succeeded. Found %d tracks.", len(tracks))
+                        return jsonify({
+                            "playlist": {
+                                "name": p_name,
+                                "description": p_desc,
+                                "author": p_author,
+                                "tracks": tracks
+                            }
+                        })
+        except Exception as e:
+            log.warning("Scrape route %s failed: %s", scrape_url, e)
 
-        return jsonify({
-            "playlist": {
-                "name": p_name,
-                "description": p_desc,
-                "author": p_author,
-                "tracks": tracks
-            }
-        })
+    # --- METHOD 2: Fallback to SpotifyDown API (If Spotify blocks us completely) ---
+    try:
+        log.info("Direct scraping blocked. Falling back to SpotifyDown API for metadata...")
+        tracklist_url = f"https://api.spotifydown.com/tracklist/playlist/{playlist_id}"
+        headers = {
+            "User-Agent": REQUEST_HEADERS["User-Agent"],
+            "Referer": "https://spotifydown.com/",
+            "Origin": "https://spotifydown.com",
+        }
+        resp = requests.get(tracklist_url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                track_list = data.get("trackList", [])
+                tracks = []
+                for index, t in enumerate(track_list):
+                    tracks.append({
+                        "id": t.get("id") or f"track_{index}",
+                        "name": t.get("title", "Unknown Track"),
+                        "artists": t.get("artists", "Unknown Artist"),
+                        "cover_url": t.get("cover"),
+                        "duration": t.get("duration", "0:00")
+                    })
+                
+                # Retrieve playlist details (title/author)
+                meta_url = f"https://api.spotifydown.com/metadata/playlist/{playlist_id}"
+                meta_resp = requests.get(meta_url, headers=headers, timeout=10)
+                p_name = "Untitled Tape"
+                p_author = "Unknown Artist"
+                if meta_resp.status_code == 200:
+                    meta_data = meta_resp.json()
+                    if meta_data.get("success"):
+                        p_name = meta_data.get("title", "Untitled Tape")
+                        p_author = meta_data.get("artists", "Unknown Artist")
 
+                log.info("SpotifyDown API fallback succeeded. Loaded %d tracks.", len(tracks))
+                return jsonify({
+                    "playlist": {
+                        "name": p_name,
+                        "description": "Retrieved via SpotifyDown API Backup",
+                        "author": p_author,
+                        "tracks": tracks
+                    }
+                })
     except Exception as e:
-        log.exception("Playlist parsing failed")
-        return jsonify({"error": str(e)}), 500
+        log.error("SpotifyDown playlist fallback failed: %s", e)
+
+    return jsonify({"error": "Failed to retrieve playlist details. Both Spotify direct scraping and our API backup were blocked."}), 500
 
 
 @app.route("/api/track/<track_id>/media", methods=["POST"])
