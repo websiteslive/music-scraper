@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("unspooler")
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app)  # Open to all origins to bypass potential CORS blocks from self-hosted frontends
 
 PLAYLIST_ID_RE = re.compile(r"playlist[/:]([a-zA-Z0-9]+)")
 NEXT_DATA_RE = re.compile(
@@ -36,10 +36,7 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# This used to cap how many tracks got FULL AUDIO generated up front. That's gone —
-# audio is now generated on-demand, one track at a time, via /api/track/<id>/media.
-# This cap only limits the lightweight metadata pass (duration + cover art), which
-# is just a page fetch per track, not a yt-dlp/ffmpeg run.
+# This caps how many tracks get a lightweight metadata pass (duration + cover art)
 MAX_METADATA_ENRICH = 200
 METADATA_FETCH_WORKERS = 6
 
