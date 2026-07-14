@@ -115,7 +115,7 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
 
 def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> str | None:
     """
-    Fallback method: Uses yt-dlp and ffmpeg to fetch the first 30s of a song from YouTube.
+    Fallback method: Uses yt-dlp and ffmpeg to fetch the full song from YouTube.
     Requires 'yt-dlp' and 'ffmpeg' installed on the system environment.
     """
     output_dir = os.path.join(os.getcwd(), "static", "previews")
@@ -132,23 +132,23 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
         ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-g", search_query]
         stream_url = subprocess.check_output(ytdlp_cmd, text=True).strip()
 
-        # 2. Use ffmpeg to grab the first 30 seconds and save it natively
+        # 2. Use ffmpeg to grab the full song and save it natively
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", stream_url,
-            "-t", "30", "-c:a", "libmp3lame", output_filename
+            "-c:a", "libmp3lame", output_filename
         ]
         subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         return f"/api/previews/{track_id}.mp3"
     except Exception as e:
-        log.error("Failed to generate custom preview for %s: %s", track_id, e)
+        log.error("Failed to generate custom audio file for %s: %s", track_id, e)
         return None
 
 
 def fetch_track_extra(track: dict) -> dict:
     """
     Fetches duration and preview-clip URL. If Spotify's URL is missing/broken,
-    it falls back to rendering our own 30s clip via YouTube/ffmpeg.
+    it falls back to rendering our own full clip via YouTube/ffmpeg.
     """
     track_id = track.get("id")
     track_name = track.get("name", "")
@@ -167,7 +167,7 @@ def fetch_track_extra(track: dict) -> dict:
     except Exception:
         log.exception("Failed to fetch track extra for %s", track_id)
 
-    # Fallback to generating a custom 30s render if Spotify gives us nothing
+    # Fallback to generating a custom full render if Spotify gives us nothing
     if not preview_url and track_name and artist_name:
         preview_url = generate_custom_preview(track_name, artist_name, track_id)
 
@@ -252,7 +252,7 @@ def api_tracks():
 
 @app.route("/api/previews/<path:filename>")
 def serve_custom_preview(filename):
-    """Serve the locally rendered 30s mp3 files."""
+    """Serve the locally rendered mp3 files."""
     return send_from_directory(os.path.join(app.root_path, 'static', 'previews'), filename)
 
 
