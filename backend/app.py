@@ -168,8 +168,8 @@ def enrich_tracks_with_metadata(tracks: list, max_workers: int = METADATA_FETCH_
 
 def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> dict:
     """
-    Uses yt-dlp to search SoundCloud and download the best audio format.
-    This avoids YouTube's aggressive IP blocks and rate limits.
+    Downloads the full audio from YouTube. Uses advanced player-client rotation
+    to bypass YouTube's datacenter IP block on Render without proxies or cookies.
     """
     output_filename = os.path.join(OUTPUT_DIR, f"{track_id}.mp3")
 
@@ -177,17 +177,21 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
     if os.path.exists(output_filename):
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
-    # Search SoundCloud instead of YouTube
-    search_query = f"scsearch1:{track_name} {track_artist}"
+    # Search YouTube with a specific query to get the cleanest full track
+    search_query = f"ytsearch1:{track_name} {track_artist} official audio"
     
     try:
-        # Run yt-dlp natively to extract and save the MP3 directly
+        # We target specific unblocked player clients (TV, Studio Creator, VR, Embedded)
+        # We also use --force-ipv4 to avoid Render's bad IPv6 routing,
+        # and clear the cache so YouTube's challenge solvers don't go stale.
         ytdlp_cmd = [
             "yt-dlp",
             "--extract-audio",
             "--audio-format", "mp3",
-            "--audio-quality", "0",      # Best quality (320kbps/VBR)
-            "--no-playlist",             # Ensure we don't grab playlists
+            "--audio-quality", "0",
+            "--force-ipv4",
+            "--rm-cache-dir",
+            "--extractor-args", "youtube:player_client=tv_downgraded,web_creator,web_embedded,android_vr",
             "-o", output_filename,
             search_query
         ]
@@ -207,10 +211,10 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
         return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed): {e}"}
     except subprocess.TimeoutExpired:
         log.error("Timed out generating audio for %s", track_id)
-        return {"url": None, "error": "Timed out reaching SoundCloud."}
+        return {"url": None, "error": "Timed out reaching YouTube."}
     except subprocess.CalledProcessError:
         log.error("Subprocess failed for %s", track_id)
-        return {"url": None, "error": "Process failed while downloading from SoundCloud."}
+        return {"url": None, "error": "Process failed — YouTube block."}
     except Exception as e:
         log.error("Failed to generate custom audio file for %s: %s", track_id, e)
         return {"url": None, "error": str(e)}
