@@ -36,7 +36,9 @@ REQUEST_HEADERS = {
 # timeout in front of them anyway). Tracks beyond the cap just come back
 # with duration/preview set to null and the frontend shows "--:--".
 MAX_PREVIEW_ENRICH = 60
-PREVIEW_FETCH_WORKERS = 10
+
+# Reduced from 10 to 3 to prevent immediate IP rate-limiting/blocking from YouTube
+PREVIEW_FETCH_WORKERS = 3
 
 
 def extract_playlist_id(url: str) -> str | None:
@@ -113,18 +115,20 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
     return playlist_name, tracks, debug_info
 
 
-def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> str | None:
+def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> dict:
     """
     Fallback method: Uses yt-dlp and ffmpeg to fetch the full song from YouTube.
     Requires 'yt-dlp' and 'ffmpeg' installed on the system environment.
+    Returns a dictionary containing the 'url' on success, or an 'error' message on failure.
     """
-    output_dir = os.path.join(os.getcwd(), "static", "previews")
+    # Aligned output directory with the Flask serving route (app.root_path)
+    output_dir = os.path.join(app.root_path, "static", "previews")
     os.makedirs(output_dir, exist_ok=True)
     output_filename = os.path.join(output_dir, f"{track_id}.mp3")
 
     # Serve it immediately if we've already cached it
     if os.path.exists(output_filename):
-        return f"/api/previews/{track_id}.mp3"
+        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
     # Switched to specifically ask for the full song to avoid short promotional clips
     search_query = f"ytsearch1:{track_name} {track_artist} full song official audio"
@@ -138,12 +142,20 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
             "ffmpeg", "-y", "-i", stream_url,
             "-c:a", "libmp3lame", output_filename
         ]
-        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Added check=True to raise an error if ffmpeg fails
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        return f"/api/previews/{track_id}.mp3"
+        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
+    
+    except FileNotFoundError as e:
+        log.error("Missing system dependency for %s: %s", track_id, e)
+        return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed): {e}"}
+    except subprocess.CalledProcessError as e:
+        log.error("Subprocess failed for %s: %s", track_id, e)
+        return {"url": None, "error": f"Process failed (YouTube rate limit/block likely): {e}"}
     except Exception as e:
         log.error("Failed to generate custom audio file for %s: %s", track_id, e)
-        return None
+        return {"url": None, "error": str(e)}
 
 
 def fetch_track_extra(track: dict) -> dict:
@@ -158,7 +170,7 @@ def fetch_track_extra(track: dict) -> dict:
     url = f"https://open.spotify.com/embed/track/{track_id}"
     
     duration_ms = None
-    preview_url = None
+    preview_data = {"url": None, "error": None}
 
     try:
         data, status_code, _ = _fetch_next_data(url)
@@ -171,9 +183,13 @@ def fetch_track_extra(track: dict) -> dict:
 
     # Always generate a custom full render from YouTube
     if track_name and artist_name:
-        preview_url = generate_custom_preview(track_name, artist_name, track_id)
+        preview_data = generate_custom_preview(track_name, artist_name, track_id)
 
-    return {"duration_ms": duration_ms, "preview_url": preview_url}
+    return {
+        "duration_ms": duration_ms, 
+        "preview_url": preview_data.get("url"),
+        "preview_error": preview_data.get("error")
+    }
 
 
 def enrich_tracks_with_previews(tracks: list, max_workers: int = PREVIEW_FETCH_WORKERS) -> list:
@@ -192,13 +208,14 @@ def enrich_tracks_with_previews(tracks: list, max_workers: int = PREVIEW_FETCH_W
             tid = future_to_id[future]
             try:
                 results[tid] = future.result()
-            except Exception:
-                results[tid] = {"duration_ms": None, "preview_url": None}
+            except Exception as e:
+                results[tid] = {"duration_ms": None, "preview_url": None, "preview_error": f"Thread failed: {str(e)}"}
 
     for t in tracks:
-        extra = results.get(t.get("id"), {"duration_ms": None, "preview_url": None})
+        extra = results.get(t.get("id"), {"duration_ms": None, "preview_url": None, "preview_error": None})
         t["duration_ms"] = extra["duration_ms"]
         t["preview_url"] = extra["preview_url"]
+        t["preview_error"] = extra["preview_error"]
 
     return tracks
 
