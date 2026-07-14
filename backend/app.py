@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import logging
 import subprocess
@@ -9,11 +10,16 @@ import requests
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("unspooler")
 
 app = Flask(__name__)
-# Wide open CORS since the frontend is a static site on a different origin (GitHub Pages).
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PLAYLIST_ID_RE = re.compile(r"playlist[/:]([a-zA-Z0-9]+)")
@@ -30,15 +36,15 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Safety valve: enriching previews means one extra HTTP request per track.
-# On a big playlist that's a lot of round trips, so cap how many we bother
-# with per request (Render/HF free tiers tend to have a ~30-60s request
-# timeout in front of them anyway). Tracks beyond the cap just come back
-# with duration/preview set to null and the frontend shows "--:--".
-MAX_PREVIEW_ENRICH = 60
+# This used to cap how many tracks got FULL AUDIO generated up front. That's gone —
+# audio is now generated on-demand, one track at a time, via /api/track/<id>/media.
+# This cap only limits the lightweight metadata pass (duration + cover art), which
+# is just a page fetch per track, not a yt-dlp/ffmpeg run.
+MAX_METADATA_ENRICH = 200
+METADATA_FETCH_WORKERS = 6
 
-# Reduced from 10 to 3 to prevent immediate IP rate-limiting/blocking from YouTube
-PREVIEW_FETCH_WORKERS = 3
+OUTPUT_DIR = os.path.join(app.root_path, "static", "previews")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def extract_playlist_id(url: str) -> str | None:
@@ -47,10 +53,6 @@ def extract_playlist_id(url: str) -> str | None:
 
 
 def _fetch_next_data(url: str, timeout: int = 15):
-    """
-    Shared helper: GETs a Spotify embed page and parses the __NEXT_DATA__
-    JSON blob out of it. Returns (data, status_code, raw_text).
-    """
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
     match = NEXT_DATA_RE.search(resp.text) if resp.status_code == 200 else None
     if not match:
@@ -61,23 +63,28 @@ def _fetch_next_data(url: str, timeout: int = 15):
         return None, resp.status_code, resp.text
 
 
+def _best_cover_url(cover_art: dict | None) -> str | None:
+    """Picks the largest available image from a Spotify coverArt.sources list."""
+    if not cover_art:
+        return None
+    sources = cover_art.get("sources") or []
+    if not sources:
+        return None
+    try:
+        best = max(sources, key=lambda s: s.get("width") or 0)
+    except (TypeError, ValueError):
+        best = sources[0]
+    return best.get("url")
+
+
 def scrape_playlist(playlist_id: str, debug: bool = False):
-    """
-    Fetches Spotify's embeddable playlist page and pulls the playlist name +
-    full track list out of its __NEXT_DATA__ JSON blob — the same data
-    Spotify's own frontend uses to render the page. No browser needed.
-    """
     url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
     debug_info = None
 
     data, status_code, raw_text = _fetch_next_data(url)
 
     if debug:
-        debug_info = {
-            "url": url,
-            "status_code": status_code,
-            "html_snippet": raw_text[:8000],
-        }
+        debug_info = {"url": url, "status_code": status_code, "html_snippet": raw_text[:8000]}
 
     if status_code != 200 or data is None:
         err = RuntimeError(
@@ -110,114 +117,111 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
             "name": t.get("title") or "Unknown title",
             "artists": t.get("subtitle") or "Unknown artist",
             "link": link,
+            "cover_url": _best_cover_url(t.get("coverArt")),
         })
 
     return playlist_name, tracks, debug_info
 
 
-def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> dict:
-    """
-    Fallback method: Uses yt-dlp and ffmpeg to fetch the full song from YouTube.
-    Requires 'yt-dlp' and 'ffmpeg' installed on the system environment.
-    Returns a dictionary containing the 'url' on success, or an 'error' message on failure.
-    """
-    # Aligned output directory with the Flask serving route (app.root_path)
-    output_dir = os.path.join(app.root_path, "static", "previews")
-    os.makedirs(output_dir, exist_ok=True)
-    output_filename = os.path.join(output_dir, f"{track_id}.mp3")
-
-    # Serve it immediately if we've already cached it
-    if os.path.exists(output_filename):
-        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
-
-    # Switched to specifically ask for the full song to avoid short promotional clips
-    search_query = f"ytsearch1:{track_name} {track_artist} full song official audio"
-    try:
-        # 1. Get the direct audio URL from YouTube without downloading
-        ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-g", search_query]
-        stream_url = subprocess.check_output(ytdlp_cmd, text=True).strip()
-
-        # 2. Use ffmpeg to grab the full song and save it natively
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", stream_url,
-            "-c:a", "libmp3lame", output_filename
-        ]
-        # Added check=True to raise an error if ffmpeg fails
-        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
-    
-    except FileNotFoundError as e:
-        log.error("Missing system dependency for %s: %s", track_id, e)
-        return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed): {e}"}
-    except subprocess.CalledProcessError as e:
-        log.error("Subprocess failed for %s: %s", track_id, e)
-        return {"url": None, "error": f"Process failed (YouTube rate limit/block likely): {e}"}
-    except Exception as e:
-        log.error("Failed to generate custom audio file for %s: %s", track_id, e)
-        return {"url": None, "error": str(e)}
-
-
-def fetch_track_extra(track: dict) -> dict:
-    """
-    Fetches duration. We explicitly bypass Spotify's native preview URL because
-    it forces a short 15-30 second snippet, and instead immediately trigger our 
-    own full clip download via YouTube/ffmpeg.
-    """
+def fetch_track_metadata(track: dict) -> dict:
+    """Lightweight per-track fetch: duration + fallback cover art. No yt-dlp/ffmpeg."""
     track_id = track.get("id")
-    track_name = track.get("name", "")
-    artist_name = track.get("artists", "")
     url = f"https://open.spotify.com/embed/track/{track_id}"
-    
+
     duration_ms = None
-    preview_data = {"url": None, "error": None}
+    cover_url = track.get("cover_url")
 
     try:
         data, status_code, _ = _fetch_next_data(url)
         if data:
             entity = data["props"]["pageProps"]["state"]["data"]["entity"]
             duration_ms = entity.get("duration")
-            # Intentionally ignoring `audioPreview` from Spotify to avoid 15s clips
+            if not cover_url:
+                cover_url = _best_cover_url(entity.get("coverArt"))
     except Exception:
-        log.exception("Failed to fetch track extra for %s", track_id)
+        log.exception("Failed to fetch track metadata for %s", track_id)
 
-    # Always generate a custom full render from YouTube
-    if track_name and artist_name:
-        preview_data = generate_custom_preview(track_name, artist_name, track_id)
-
-    return {
-        "duration_ms": duration_ms, 
-        "preview_url": preview_data.get("url"),
-        "preview_error": preview_data.get("error")
-    }
+    return {"duration_ms": duration_ms, "cover_url": cover_url}
 
 
-def enrich_tracks_with_previews(tracks: list, max_workers: int = PREVIEW_FETCH_WORKERS) -> list:
-    """
-    Concurrently fetches duration + full audio track for each item. Caps how many 
-    tracks get enriched (see MAX_PREVIEW_ENRICH) to keep response times reasonable.
-    """
-    to_enrich = [t for t in tracks if t.get("id")][:MAX_PREVIEW_ENRICH]
+def enrich_tracks_with_metadata(tracks: list, max_workers: int = METADATA_FETCH_WORKERS) -> list:
+    to_enrich = [t for t in tracks if t.get("id")][:MAX_METADATA_ENRICH]
     results = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_id = {
-            executor.submit(fetch_track_extra, t): t["id"] for t in to_enrich
-        }
+        future_to_id = {executor.submit(fetch_track_metadata, t): t["id"] for t in to_enrich}
         for future in as_completed(future_to_id):
             tid = future_to_id[future]
             try:
                 results[tid] = future.result()
-            except Exception as e:
-                results[tid] = {"duration_ms": None, "preview_url": None, "preview_error": f"Thread failed: {str(e)}"}
+            except Exception:
+                results[tid] = {"duration_ms": None, "cover_url": None}
 
     for t in tracks:
-        extra = results.get(t.get("id"), {"duration_ms": None, "preview_url": None, "preview_error": None})
+        extra = results.get(t.get("id"), {"duration_ms": None, "cover_url": t.get("cover_url")})
         t["duration_ms"] = extra["duration_ms"]
-        t["preview_url"] = extra["preview_url"]
-        t["preview_error"] = extra["preview_error"]
+        if extra.get("cover_url"):
+            t["cover_url"] = extra["cover_url"]
 
     return tracks
+
+
+def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> dict:
+    """
+    Uses yt-dlp + ffmpeg to fetch the full song from YouTube. Requires both
+    installed on the server (on Render, that means a Dockerfile — the native/
+    nixpacks Python runtime does NOT have ffmpeg by default). Called on-demand
+    for a single track now, never for a whole playlist at once.
+    """
+    output_filename = os.path.join(OUTPUT_DIR, f"{track_id}.mp3")
+
+    if os.path.exists(output_filename):
+        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
+
+    search_query = f"ytsearch1:{track_name} {track_artist} full song official audio"
+    try:
+        ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-g", search_query]
+        stream_url = subprocess.check_output(ytdlp_cmd, text=True, timeout=60).strip()
+
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", stream_url, "-c:a", "libmp3lame", output_filename]
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=True, timeout=120)
+
+        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
+
+    except FileNotFoundError as e:
+        log.error("Missing system dependency for %s: %s", track_id, e)
+        return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed on the server): {e}"}
+    except subprocess.TimeoutExpired:
+        log.error("Timed out generating audio for %s", track_id)
+        return {"url": None, "error": "Timed out reaching YouTube (likely rate-limited/blocked from this server's IP)."}
+    except subprocess.CalledProcessError:
+        log.error("Subprocess failed for %s", track_id)
+        return {"url": None, "error": "Process failed — YouTube rate limit/block from this server's IP is the most common cause."}
+    except Exception as e:
+        log.error("Failed to generate custom audio file for %s: %s", track_id, e)
+        return {"url": None, "error": str(e)}
+
+
+def save_cover_webp(track_id: str, cover_url: str) -> dict:
+    """Downloads a track's cover art and saves it as a .webp for the spooler zip."""
+    output_filename = os.path.join(OUTPUT_DIR, f"{track_id}_cover.webp")
+
+    if os.path.exists(output_filename):
+        return {"url": f"/api/previews/{track_id}_cover.webp", "error": None}
+
+    if not PIL_AVAILABLE:
+        return {"url": None, "error": "Pillow isn't installed on the server (add 'Pillow' to requirements.txt)."}
+
+    try:
+        resp = requests.get(cover_url, headers=REQUEST_HEADERS, timeout=15)
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        img.save(output_filename, "WEBP", quality=90)
+        return {"url": f"/api/previews/{track_id}_cover.webp", "error": None}
+    except Exception as e:
+        log.error("Failed to save cover art for %s: %s", track_id, e)
+        return {"url": None, "error": str(e)}
 
 
 @app.route("/api/tracks", methods=["POST"])
@@ -226,9 +230,6 @@ def api_tracks():
     playlist_url = data.get("playlist_url", "")
     playlist_id = extract_playlist_id(playlist_url)
     debug = bool(data.get("debug", False))
-    # Let the frontend opt out of the extra per-track requests if it just
-    # wants the fast link list.
-    with_previews = bool(data.get("with_previews", True))
 
     if not playlist_id:
         return jsonify({"error": "That doesn't look like a Spotify playlist link."}), 400
@@ -253,34 +254,55 @@ def api_tracks():
             payload["debug"] = debug_info
         return jsonify(payload), 404
 
-    if with_previews:
-        tracks = enrich_tracks_with_previews(tracks)
+    # Fast pass only: duration + cover art. No audio generation here anymore.
+    tracks = enrich_tracks_with_metadata(tracks)
 
-    response = {
-        "playlist_name": name or "Tracklist",
-        "count": len(tracks),
-        "tracks": tracks,
-        "previews_truncated": with_previews and len(tracks) > MAX_PREVIEW_ENRICH,
-    }
+    response = {"playlist_name": name or "Tracklist", "count": len(tracks), "tracks": tracks}
     if debug and debug_info:
         response["debug"] = debug_info
 
     return jsonify(response)
 
 
+@app.route("/api/track/<track_id>/media", methods=["POST"])
+def api_track_media(track_id):
+    """
+    On-demand, single-track endpoint. Generates the full-song mp3 and, if a
+    cover_url is provided, saves cover art as .webp. Called only when the
+    user wants to play/download/zip that specific track.
+    """
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    artist = (data.get("artists") or "").strip()
+    cover_url = data.get("cover_url")
+
+    result = {"preview_url": None, "preview_error": None, "cover_url": None, "cover_error": None}
+
+    if not name or not artist:
+        result["preview_error"] = "Missing track name/artist."
+    else:
+        preview = generate_custom_preview(name, artist, track_id)
+        result["preview_url"] = preview.get("url")
+        result["preview_error"] = preview.get("error")
+
+    if cover_url:
+        cover = save_cover_webp(track_id, cover_url)
+        result["cover_url"] = cover.get("url")
+        result["cover_error"] = cover.get("error")
+
+    return jsonify(result)
+
+
 @app.route("/api/previews/<path:filename>")
 def serve_custom_preview(filename):
-    """Serve the locally rendered mp3 files."""
-    return send_from_directory(os.path.join(app.root_path, 'static', 'previews'), filename)
+    return send_from_directory(OUTPUT_DIR, filename)
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "pillow": PIL_AVAILABLE})
 
 
 if __name__ == "__main__":
-    # Render assigns a port dynamically via $PORT; Hugging Face Spaces (Docker SDK)
-    # expects 7860 specifically, so this falls back to that if PORT isn't set.
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
