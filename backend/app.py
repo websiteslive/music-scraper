@@ -3,10 +3,10 @@ import re
 import io
 import json
 import logging
+import yt_dlp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-import yt_dlp
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -36,6 +36,10 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# This used to cap how many tracks got FULL AUDIO generated up front. That's gone —
+# audio is now generated on-demand, one track at a time, via /api/track/<id>/media.
+# This cap only limits the lightweight metadata pass (duration + cover art), which
+# is just a page fetch per track, not a yt-dlp/ffmpeg run.
 MAX_METADATA_ENRICH = 200
 METADATA_FETCH_WORKERS = 6
 
@@ -60,6 +64,7 @@ def _fetch_next_data(url: str, timeout: int = 15):
 
 
 def _best_cover_url(cover_art: dict | None) -> str | None:
+    """Picks the largest available image from a Spotify coverArt.sources list."""
     if not cover_art:
         return None
     sources = cover_art.get("sources") or []
@@ -119,6 +124,7 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
 
 
 def fetch_track_metadata(track: dict) -> dict:
+    """Lightweight per-track fetch: duration + fallback cover art. No yt-dlp/ffmpeg."""
     track_id = track.get("id")
     url = f"https://open.spotify.com/embed/track/{track_id}"
 
@@ -171,11 +177,11 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
     if os.path.exists(output_filename):
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
-    # Search up to 5 SoundCloud tracks to find a match
-    search_query = f"scsearch5:{track_name} {track_artist}"
+    # Search up to 10 SoundCloud tracks to find a match
+    search_query = f"scsearch10:{track_name} {track_artist}"
     target_duration = duration_ms / 1000 if duration_ms else None
 
-    # Sunnify's Match Filter: Reject downloads that deviate by more than ±30 seconds
+    # Sunnify's Match Filter: Reject downloads that deviate by more than ±60 seconds
     def match_filter(info, *, incomplete):
         if not target_duration:
             return None # Skip validation if we don't have the original track duration
@@ -184,8 +190,8 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
         if not video_duration:
             return None
 
-        # Accept if the match is within a 30-second window
-        if abs(video_duration - target_duration) <= 30:
+        # Accept if the match is within a 60-second window
+        if abs(video_duration - target_duration) <= 60:
             return None 
 
         return f"Duration mismatch: found {video_duration}s, expected {target_duration}s"
@@ -203,7 +209,7 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True,  # <-- NEW: Tells yt-dlp to bypass DRM blocks and check the next result
+        'ignoreerrors': True,  # Bypasses DRM blocks and continues searching
     }
 
     try:
@@ -211,7 +217,7 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
             ydl.download([search_query])
             
     except Exception as e:
-        # <-- NEW: Handles the fake "max downloads reached" error
+        # Handles the "max downloads reached" error (which is actually a success)
         if os.path.exists(output_filename):
             pass 
         else:
@@ -219,7 +225,7 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
             err_msg = str(e).replace("ERROR: ", "")
             
             if "Duration mismatch" in err_msg:
-                return {"url": None, "error": "No results matched the exact Spotify track length."}
+                return {"url": None, "error": "No results matched the track length."}
                 
             return {"url": None, "error": err_msg}
 
@@ -231,13 +237,14 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
 
 
 def save_cover_webp(track_id: str, cover_url: str) -> dict:
+    """Downloads a track's cover art and saves it as a .webp for the spooler zip."""
     output_filename = os.path.join(OUTPUT_DIR, f"{track_id}_cover.webp")
 
     if os.path.exists(output_filename):
         return {"url": f"/api/previews/{track_id}_cover.webp", "error": None}
 
     if not PIL_AVAILABLE:
-        return {"url": None, "error": "Pillow isn't installed on the server."}
+        return {"url": None, "error": "Pillow isn't installed on the server (add 'Pillow' to requirements.txt)."}
 
     try:
         resp = requests.get(cover_url, headers=REQUEST_HEADERS, timeout=15)
@@ -280,6 +287,7 @@ def api_tracks():
             payload["debug"] = debug_info
         return jsonify(payload), 404
 
+    # Fast pass only: duration + cover art. No audio generation here anymore.
     tracks = enrich_tracks_with_metadata(tracks)
 
     response = {"playlist_name": name or "Tracklist", "count": len(tracks), "tracks": tracks}
@@ -291,6 +299,11 @@ def api_tracks():
 
 @app.route("/api/track/<track_id>/media", methods=["POST"])
 def api_track_media(track_id):
+    """
+    On-demand, single-track endpoint. Generates the full-song mp3 and, if a
+    cover_url is provided, saves cover art as .webp. Called only when the
+    user wants to play/download/zip that specific track.
+    """
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     artist = (data.get("artists") or "").strip()
