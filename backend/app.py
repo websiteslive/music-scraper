@@ -36,154 +36,111 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# This used to cap how many tracks got FULL AUDIO generated up front. That's gone —
-# audio is now generated on-demand, one track at a time, via /api/track/<id>/media.
-# This cap only limits the lightweight metadata pass (duration + cover art), which
-# is just a page fetch per track, not a yt-dlp/ffmpeg run.
-MAX_METADATA_ENRICH = 200
-METADATA_FETCH_WORKERS = 6
-
-OUTPUT_DIR = os.path.join(app.root_path, "static", "previews")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_previews")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def extract_playlist_id(url: str) -> str | None:
-    m = PLAYLIST_ID_RE.search(url or "")
-    return m.group(1) if m else None
-
-
-def _fetch_next_data(url: str, timeout: int = 15):
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
-    match = NEXT_DATA_RE.search(resp.text) if resp.status_code == 200 else None
-    if not match:
-        return None, resp.status_code, resp.text
+def scrape_youtube_video_id(query: str) -> str:
+    """
+    Performs a lightweight, block-resistant pure HTML search on YouTube
+    to find the top video ID for a track.
+    """
     try:
-        return json.loads(match.group(1)), resp.status_code, resp.text
-    except json.JSONDecodeError:
-        return None, resp.status_code, resp.text
-
-
-def _best_cover_url(cover_art: dict | None) -> str | None:
-    """Picks the largest available image from a Spotify coverArt.sources list."""
-    if not cover_art:
-        return None
-    sources = cover_art.get("sources") or []
-    if not sources:
-        return None
-    try:
-        best = max(sources, key=lambda s: s.get("width") or 0)
-    except (TypeError, ValueError):
-        best = sources[0]
-    return best.get("url")
-
-
-def scrape_playlist(playlist_id: str, debug: bool = False):
-    url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
-    debug_info = None
-
-    data, status_code, raw_text = _fetch_next_data(url)
-
-    if debug:
-        debug_info = {"url": url, "status_code": status_code, "html_snippet": raw_text[:8000]}
-
-    if status_code != 200 or data is None:
-        err = RuntimeError(
-            "Spotify didn't return a track list for this playlist. "
-            "It may be private, empty, or region-locked."
-        )
-        err.debug_info = debug_info
-        raise err
-
-    try:
-        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
-    except (KeyError, TypeError):
-        err = RuntimeError(
-            "Spotify didn't return a track list for this playlist. "
-            "It may be private, empty, or region-locked."
-        )
-        err.debug_info = debug_info
-        raise err
-
-    playlist_name = entity.get("title") or entity.get("name")
-    track_list = entity.get("trackList") or []
-
-    tracks = []
-    for t in track_list:
-        uri = t.get("uri", "")
-        track_id = uri.split(":")[-1] if uri else None
-        link = f"https://open.spotify.com/embed/track/{track_id}" if track_id else ""
-        tracks.append({
-            "id": track_id,
-            "name": t.get("title") or "Unknown title",
-            "artists": t.get("subtitle") or "Unknown artist",
-            "link": link,
-            "cover_url": _best_cover_url(t.get("coverArt")),
-        })
-
-    return playlist_name, tracks, debug_info
-
-
-def fetch_track_metadata(track: dict) -> dict:
-    """Lightweight per-track fetch: duration + fallback cover art. No yt-dlp/ffmpeg."""
-    track_id = track.get("id")
-    url = f"https://open.spotify.com/embed/track/{track_id}"
-
-    duration_ms = None
-    cover_url = track.get("cover_url")
-
-    try:
-        data, status_code, _ = _fetch_next_data(url)
-        if data:
-            entity = data["props"]["pageProps"]["state"]["data"]["entity"]
-            duration_ms = entity.get("duration")
-            if not cover_url:
-                cover_url = _best_cover_url(entity.get("coverArt"))
-    except Exception:
-        log.exception("Failed to fetch track metadata for %s", track_id)
-
-    return {"duration_ms": duration_ms, "cover_url": cover_url}
-
-
-def enrich_tracks_with_metadata(tracks: list, max_workers: int = METADATA_FETCH_WORKERS) -> list:
-    to_enrich = [t for t in tracks if t.get("id")][:MAX_METADATA_ENRICH]
-    results = {}
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_id = {executor.submit(fetch_track_metadata, t): t["id"] for t in to_enrich}
-        for future in as_completed(future_to_id):
-            tid = future_to_id[future]
-            try:
-                results[tid] = future.result()
-            except Exception:
-                results[tid] = {"duration_ms": None, "cover_url": None}
-
-    for t in tracks:
-        extra = results.get(t.get("id"), {"duration_ms": None, "cover_url": t.get("cover_url")})
-        t["duration_ms"] = extra["duration_ms"]
-        if extra.get("cover_url"):
-            t["cover_url"] = extra["cover_url"]
-
-    return tracks
+        url = f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
+        r = requests.get(url, headers=REQUEST_HEADERS, timeout=10)
+        if r.status_code == 200:
+            matches = re.findall(r"watch\?v=([a-zA-Z0-9_-]{11})", r.text)
+            if matches:
+                return matches[0]
+    except Exception as e:
+        log.warning("Lightweight YouTube search failed: %s", e)
+    return None
 
 
 def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> dict:
     """
-    Downloads the full audio from YouTube. Uses advanced player-client rotation
-    to bypass YouTube's datacenter IP block on Render without proxies or cookies.
+    Downloads the full MP3 using a 3-Tier bypass system:
+    Tier 1: Direct SpotifyDown API (No YouTube blocks, 100% full quality)
+    Tier 2: YouTube HTML Scraping + Cobalt Downloader API
+    Tier 3: Optimized native yt-dlp (Fallback)
     """
     output_filename = os.path.join(OUTPUT_DIR, f"{track_id}.mp3")
 
-    # If already downloaded, return immediately
     if os.path.exists(output_filename):
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
-    # Search YouTube with a specific query to get the cleanest full track
-    search_query = f"ytsearch1:{track_name} {track_artist} official audio"
-    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # --- TIER 1: SpotifyDown API (Fastest & most reliable) ---
+    if track_id and len(track_id) == 22:  # Valid Spotify Track ID length
+        try:
+            log.info("Tier 1: Querying SpotifyDown for: %s", track_id)
+            api_url = f"https://api.spotifydown.com/download/{track_id}"
+            headers = {
+                "User-Agent": REQUEST_HEADERS["User-Agent"],
+                "Referer": "https://spotifydown.com/",
+                "Origin": "https://spotifydown.com",
+            }
+            response = requests.get(api_url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success") and data.get("link"):
+                    download_url = data["link"]
+                    log.info("SpotifyDown URL found, downloading MP3...")
+                    file_resp = requests.get(download_url, headers=headers, timeout=45, stream=True)
+                    if file_resp.status_code == 200:
+                        with open(output_filename, "wb") as f:
+                            for chunk in file_resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        log.info("Tier 1 successfully downloaded: %s", track_id)
+                        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
+        except Exception as e:
+            log.warning("Tier 1 failed for %s: %s", track_id, e)
+
+    # --- TIER 2: YouTube Search + Cobalt API (Bypasses local IP limits) ---
     try:
-        # We target specific unblocked player clients (TV, Studio Creator, VR, Embedded)
-        # We also use --force-ipv4 to avoid Render's bad IPv6 routing,
-        # and clear the cache so YouTube's challenge solvers don't go stale.
+        log.info("Tier 2: Scraping YouTube search for: %s - %s", track_name, track_artist)
+        search_query = f"{track_name} {track_artist} official audio"
+        video_id = scrape_youtube_video_id(search_query)
+
+        if video_id:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            log.info("Found YouTube Video URL: %s. Handing off to Cobalt...", video_url)
+            
+            cobalt_url = "https://api.cobalt.tools/api/json"
+            cobalt_headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            cobalt_payload = {
+                "url": video_url,
+                "downloadMode": "audio",
+                "audioFormat": "mp3",
+                "audioQuality": "320"
+            }
+            
+            cobalt_resp = requests.post(cobalt_url, json=cobalt_payload, headers=cobalt_headers, timeout=20)
+            if cobalt_resp.status_code == 200:
+                cobalt_data = cobalt_resp.json()
+                direct_download_url = cobalt_data.get("url")
+                if direct_download_url:
+                    log.info("Cobalt direct link acquired! Streaming to storage...")
+                    file_resp = requests.get(direct_download_url, timeout=45, stream=True)
+                    if file_resp.status_code == 200:
+                        with open(output_filename, "wb") as f:
+                            for chunk in file_resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        log.info("Tier 2 successfully downloaded: %s", track_id)
+                        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
+    except Exception as e:
+        log.warning("Tier 2 failed for %s: %s", track_id, e)
+
+    # --- TIER 3: Local yt-dlp Native Run (Last Resort fallback) ---
+    try:
+        log.info("Tier 3: Running local yt-dlp for: %s", track_name)
+        search_query = f"ytsearch1:{track_name} {track_artist} official audio"
         ytdlp_cmd = [
             "yt-dlp",
             "--extract-audio",
@@ -204,89 +161,138 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
             timeout=120
         )
 
-        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
+        if os.path.exists(output_filename):
+            log.info("Tier 3 fallback downloaded track successfully!")
+            return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
     except FileNotFoundError as e:
-        log.error("Missing system dependency for %s: %s", track_id, e)
+        log.error("Missing dependency: %s", e)
         return {"url": None, "error": f"Missing dependency (yt-dlp or ffmpeg not installed): {e}"}
-    except subprocess.TimeoutExpired:
-        log.error("Timed out generating audio for %s", track_id)
-        return {"url": None, "error": "Timed out reaching YouTube."}
-    except subprocess.CalledProcessError:
-        log.error("Subprocess failed for %s", track_id)
-        return {"url": None, "error": "Process failed — YouTube block."}
     except Exception as e:
-        log.error("Failed to generate custom audio file for %s: %s", track_id, e)
-        return {"url": None, "error": str(e)}
+        log.error("All tiers failed to fetch audio for %s: %s", track_id, e)
+        return {"url": None, "error": f"All download mechanisms failed: {e}"}
 
 
 def save_cover_webp(track_id: str, cover_url: str) -> dict:
-    """Downloads a track's cover art and saves it as a .webp for the spooler zip."""
-    output_filename = os.path.join(OUTPUT_DIR, f"{track_id}_cover.webp")
-
+    """
+    Downloads raw image bytes and writes them to a .webp file.
+    """
+    output_filename = os.path.join(OUTPUT_DIR, f"{track_id}.webp")
     if os.path.exists(output_filename):
-        return {"url": f"/api/previews/{track_id}_cover.webp", "error": None}
-
-    if not PIL_AVAILABLE:
-        return {"url": None, "error": "Pillow isn't installed on the server (add 'Pillow' to requirements.txt)."}
+        return {"url": f"/api/previews/{track_id}.webp", "error": None}
 
     try:
         resp = requests.get(cover_url, headers=REQUEST_HEADERS, timeout=15)
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        img.save(output_filename, "WEBP", quality=90)
-        return {"url": f"/api/previews/{track_id}_cover.webp", "error": None}
+        if resp.status_code == 200:
+            image_data = resp.content
+            if PIL_AVAILABLE:
+                try:
+                    img = Image.open(io.BytesIO(image_data))
+                    img.save(output_filename, format="WEBP", quality=80)
+                    return {"url": f"/api/previews/{track_id}.webp", "error": None}
+                except Exception as e:
+                    log.error("PIL webp conversion failed for %s: %s", track_id, e)
+
+            # Fallback if PIL is not present
+            with open(output_filename, "wb") as f:
+                f.write(image_data)
+            return {"url": f"/api/previews/{track_id}.webp", "error": None}
+        else:
+            return {"url": None, "error": f"HTTP {resp.status_code}"}
     except Exception as e:
-        log.error("Failed to save cover art for %s: %s", track_id, e)
+        log.error("Failed to download cover for %s: %s", track_id, e)
         return {"url": None, "error": str(e)}
 
 
-@app.route("/api/tracks", methods=["POST"])
-def api_tracks():
+@app.route("/api/playlist", methods=["POST"])
+def api_playlist():
+    """
+    Accepts a Spotify/YouTube playlist URL, scrapes metadata,
+    and returns metadata list of tracks.
+    """
     data = request.get_json(silent=True) or {}
-    playlist_url = data.get("playlist_url", "")
-    playlist_id = extract_playlist_id(playlist_url)
-    debug = bool(data.get("debug", False))
+    url = data.get("url", "").strip()
 
-    if not playlist_id:
-        return jsonify({"error": "That doesn't look like a Spotify playlist link."}), 400
+    if not url:
+        return jsonify({"error": "No URL provided."}), 400
+
+    match = PLAYLIST_ID_RE.search(url)
+    if not match:
+        return jsonify({"error": "Invalid Spotify URL."}), 400
+
+    playlist_id = match.group(1)
+    scrape_url = f"https://open.spotify.com/playlist/{playlist_id}"
 
     try:
-        name, tracks, debug_info = scrape_playlist(playlist_id, debug=debug)
-    except RuntimeError as e:
-        payload = {"error": str(e)}
-        if debug and getattr(e, "debug_info", None):
-            payload["debug"] = e.debug_info
-        return jsonify(payload), 502
-    except requests.RequestException as e:
-        log.exception("Request to Spotify failed")
-        return jsonify({"error": f"Couldn't reach Spotify: {e}"}), 502
+        resp = requests.get(scrape_url, headers=REQUEST_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return jsonify({"error": f"Spotify returned HTTP {resp.status_code}"}), 500
+
+        script_match = NEXT_DATA_RE.search(resp.text)
+        if not script_match:
+            return jsonify({"error": "Could not extract playlist data from HTML structure."}), 500
+
+        next_json = json.loads(script_match.group(1))
+        
+        # Access nested elements in NEXT_DATA layout safely
+        try:
+            page_props = next_json["props"]["pageProps"]
+            state = page_props.get("state") or page_props.get("fallback") or {}
+            playlist_key = next(k for k in state.keys() if "playlist" in k)
+            playlist_obj = state[playlist_key]["data"]["playlistV2"]
+        except Exception:
+            return jsonify({"error": "Parsing layout elements failed."}), 500
+
+        p_name = playlist_obj.get("name", "Untitled Tape")
+        p_desc = playlist_obj.get("description", "")
+        p_author = playlist_obj.get("ownerV2", {}).get("name", "Unknown Artist")
+
+        tracks_items = playlist_obj.get("content", {}).get("items", [])
+        tracks = []
+        for index, item in enumerate(tracks_items):
+            item_data = item.get("itemV2", {}).get("data", {})
+            if not item_data:
+                continue
+
+            t_id = item_data.get("id")
+            t_name = item_data.get("name", "Unknown Track")
+            
+            artists_list = item_data.get("artists", {}).get("items", [])
+            t_artists = ", ".join([a.get("profile", {}).get("name", "Unknown") for a in artists_list])
+
+            images_list = item_data.get("albumOfTrack", {}).get("coverArt", {}).get("sources", [])
+            t_cover = images_list[0].get("url") if images_list else None
+
+            duration_ms = item_data.get("duration", {}).get("totalMillisecondsValue", 0)
+            t_duration = f"{int(duration_ms / 60000)}:{int((duration_ms % 60000) / 1000):02d}"
+
+            tracks.append({
+                "id": t_id or f"track_{index}",
+                "name": t_name,
+                "artists": t_artists,
+                "cover_url": t_cover,
+                "duration": t_duration
+            })
+
+        return jsonify({
+            "playlist": {
+                "name": p_name,
+                "description": p_desc,
+                "author": p_author,
+                "tracks": tracks
+            }
+        })
+
     except Exception as e:
-        log.exception("Scrape failed")
-        return jsonify({"error": f"Scrape failed: {e}"}), 500
-
-    if not tracks:
-        payload = {"error": "No tracks found — the playlist may be private or empty."}
-        if debug and debug_info:
-            payload["debug"] = debug_info
-        return jsonify(payload), 404
-
-    # Fast pass only: duration + cover art. No audio generation here anymore.
-    tracks = enrich_tracks_with_metadata(tracks)
-
-    response = {"playlist_name": name or "Tracklist", "count": len(tracks), "tracks": tracks}
-    if debug and debug_info:
-        response["debug"] = debug_info
-
-    return jsonify(response)
+        log.exception("Playlist parsing failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/track/<track_id>/media", methods=["POST"])
 def api_track_media(track_id):
     """
-    On-demand, single-track endpoint. Generates the full-song mp3 and, if a
-    cover_url is provided, saves cover art as .webp. Called only when the
-    user wants to play/download/zip that specific track.
+    On-demand single-track media fetch. Generates the full-song MP3
+    and outputs the webp album cover art.
     """
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
@@ -315,11 +321,5 @@ def serve_custom_preview(filename):
     return send_from_directory(OUTPUT_DIR, filename)
 
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "pillow": PIL_AVAILABLE})
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
