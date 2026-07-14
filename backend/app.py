@@ -2,9 +2,11 @@ import os
 import re
 import json
 import logging
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 logging.basicConfig(level=logging.INFO)
@@ -28,10 +30,33 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Safety valve: enriching previews means one extra HTTP request per track.
+# On a big playlist that's a lot of round trips, so cap how many we bother
+# with per request (Render/HF free tiers tend to have a ~30-60s request
+# timeout in front of them anyway). Tracks beyond the cap just come back
+# with duration/preview set to null and the frontend shows "--:--".
+MAX_PREVIEW_ENRICH = 60
+PREVIEW_FETCH_WORKERS = 10
+
 
 def extract_playlist_id(url: str) -> str | None:
     m = PLAYLIST_ID_RE.search(url or "")
     return m.group(1) if m else None
+
+
+def _fetch_next_data(url: str, timeout: int = 15):
+    """
+    Shared helper: GETs a Spotify embed page and parses the __NEXT_DATA__
+    JSON blob out of it. Returns (data, status_code, raw_text).
+    """
+    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+    match = NEXT_DATA_RE.search(resp.text) if resp.status_code == 200 else None
+    if not match:
+        return None, resp.status_code, resp.text
+    try:
+        return json.loads(match.group(1)), resp.status_code, resp.text
+    except json.JSONDecodeError:
+        return None, resp.status_code, resp.text
 
 
 def scrape_playlist(playlist_id: str, debug: bool = False):
@@ -43,25 +68,16 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
     url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
     debug_info = None
 
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
+    data, status_code, raw_text = _fetch_next_data(url)
 
     if debug:
         debug_info = {
             "url": url,
-            "status_code": resp.status_code,
-            "html_snippet": resp.text[:8000],
+            "status_code": status_code,
+            "html_snippet": raw_text[:8000],
         }
 
-    if resp.status_code != 200:
-        err = RuntimeError(
-            "Spotify didn't return a track list for this playlist. "
-            "It may be private, empty, or region-locked."
-        )
-        err.debug_info = debug_info
-        raise err
-
-    match = NEXT_DATA_RE.search(resp.text)
-    if not match:
+    if status_code != 200 or data is None:
         err = RuntimeError(
             "Spotify didn't return a track list for this playlist. "
             "It may be private, empty, or region-locked."
@@ -70,9 +86,8 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
         raise err
 
     try:
-        data = json.loads(match.group(1))
         entity = data["props"]["pageProps"]["state"]["data"]["entity"]
-    except (json.JSONDecodeError, KeyError, TypeError):
+    except (KeyError, TypeError):
         err = RuntimeError(
             "Spotify didn't return a track list for this playlist. "
             "It may be private, empty, or region-locked."
@@ -89,6 +104,7 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
         track_id = uri.split(":")[-1] if uri else None
         link = f"https://open.spotify.com/embed/track/{track_id}" if track_id else ""
         tracks.append({
+            "id": track_id,
             "name": t.get("title") or "Unknown title",
             "artists": t.get("subtitle") or "Unknown artist",
             "link": link,
@@ -97,12 +113,104 @@ def scrape_playlist(playlist_id: str, debug: bool = False):
     return playlist_name, tracks, debug_info
 
 
+def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -> str | None:
+    """
+    Fallback method: Uses yt-dlp and ffmpeg to fetch the first 30s of a song from YouTube.
+    Requires 'yt-dlp' and 'ffmpeg' installed on the system environment.
+    """
+    output_dir = os.path.join(os.getcwd(), "static", "previews")
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, f"{track_id}.mp3")
+
+    # Serve it immediately if we've already cached it
+    if os.path.exists(output_filename):
+        return f"/api/previews/{track_id}.mp3"
+
+    search_query = f"ytsearch1:{track_name} {track_artist} official audio"
+    try:
+        # 1. Get the direct audio URL from YouTube without downloading
+        ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-g", search_query]
+        stream_url = subprocess.check_output(ytdlp_cmd, text=True).strip()
+
+        # 2. Use ffmpeg to grab the first 30 seconds and save it natively
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", stream_url,
+            "-t", "30", "-c:a", "libmp3lame", output_filename
+        ]
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return f"/api/previews/{track_id}.mp3"
+    except Exception as e:
+        log.error("Failed to generate custom preview for %s: %s", track_id, e)
+        return None
+
+
+def fetch_track_extra(track: dict) -> dict:
+    """
+    Fetches duration and preview-clip URL. If Spotify's URL is missing/broken,
+    it falls back to rendering our own 30s clip via YouTube/ffmpeg.
+    """
+    track_id = track.get("id")
+    track_name = track.get("name", "")
+    artist_name = track.get("artists", "")
+    url = f"https://open.spotify.com/embed/track/{track_id}"
+    
+    duration_ms = None
+    preview_url = None
+
+    try:
+        data, status_code, _ = _fetch_next_data(url)
+        if data:
+            entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+            duration_ms = entity.get("duration")
+            preview_url = (entity.get("audioPreview") or {}).get("url")
+    except Exception:
+        log.exception("Failed to fetch track extra for %s", track_id)
+
+    # Fallback to generating a custom 30s render if Spotify gives us nothing
+    if not preview_url and track_name and artist_name:
+        preview_url = generate_custom_preview(track_name, artist_name, track_id)
+
+    return {"duration_ms": duration_ms, "preview_url": preview_url}
+
+
+def enrich_tracks_with_previews(tracks: list, max_workers: int = PREVIEW_FETCH_WORKERS) -> list:
+    """
+    Concurrently fetches duration + preview URL for each track and merges the
+    results back in. Caps how many tracks get enriched (see MAX_PREVIEW_ENRICH)
+    to keep response times reasonable on large playlists.
+    """
+    to_enrich = [t for t in tracks if t.get("id")][:MAX_PREVIEW_ENRICH]
+    results = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_id = {
+            executor.submit(fetch_track_extra, t): t["id"] for t in to_enrich
+        }
+        for future in as_completed(future_to_id):
+            tid = future_to_id[future]
+            try:
+                results[tid] = future.result()
+            except Exception:
+                results[tid] = {"duration_ms": None, "preview_url": None}
+
+    for t in tracks:
+        extra = results.get(t.get("id"), {"duration_ms": None, "preview_url": None})
+        t["duration_ms"] = extra["duration_ms"]
+        t["preview_url"] = extra["preview_url"]
+
+    return tracks
+
+
 @app.route("/api/tracks", methods=["POST"])
 def api_tracks():
     data = request.get_json(silent=True) or {}
     playlist_url = data.get("playlist_url", "")
     playlist_id = extract_playlist_id(playlist_url)
     debug = bool(data.get("debug", False))
+    # Let the frontend opt out of the extra per-track requests if it just
+    # wants the fast link list.
+    with_previews = bool(data.get("with_previews", True))
 
     if not playlist_id:
         return jsonify({"error": "That doesn't look like a Spotify playlist link."}), 400
@@ -127,15 +235,25 @@ def api_tracks():
             payload["debug"] = debug_info
         return jsonify(payload), 404
 
+    if with_previews:
+        tracks = enrich_tracks_with_previews(tracks)
+
     response = {
         "playlist_name": name or "Tracklist",
         "count": len(tracks),
         "tracks": tracks,
+        "previews_truncated": with_previews and len(tracks) > MAX_PREVIEW_ENRICH,
     }
     if debug and debug_info:
         response["debug"] = debug_info
 
     return jsonify(response)
+
+
+@app.route("/api/previews/<path:filename>")
+def serve_custom_preview(filename):
+    """Serve the locally rendered 30s mp3 files."""
+    return send_from_directory(os.path.join(app.root_path, 'static', 'previews'), filename)
 
 
 @app.route("/api/health", methods=["GET"])
