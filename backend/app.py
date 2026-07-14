@@ -165,7 +165,8 @@ def enrich_tracks_with_metadata(tracks: list, max_workers: int = METADATA_FETCH_
 
 def generate_custom_preview(track_name: str, track_artist: str, track_id: str, duration_ms: int = None) -> dict:
     """
-    Uses native yt-dlp to search SoundCloud with multi-search fallback and duration matching.
+    Searches SoundCloud with strict studio-matching filters.
+    Discards pitched, sped-up, slowed, and cover edits.
     """
     output_filename = os.path.join(OUTPUT_DIR, f"{track_id}.mp3")
     output_template = os.path.join(OUTPUT_DIR, f"{track_id}.%(ext)s")
@@ -174,11 +175,11 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
     if os.path.exists(output_filename):
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
-    # Search up to 10 SoundCloud tracks to find a match
+    # Search up to 10 SoundCloud tracks to inspect candidates
     search_query = f"scsearch10:{track_name} {track_artist}"
     target_duration = duration_ms / 1000 if duration_ms else None
 
-    # Sunnify's Match Filter: Reject downloads that deviate by more than ±60 seconds
+    # Sunnify's Match Filter: Strict duration checks and bedroom-edit blocklist
     def match_filter(info, *, incomplete):
         if not target_duration:
             return None # Skip validation if we don't have the original track duration
@@ -187,11 +188,29 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
         if not video_duration:
             return None
 
-        # Accept if the match is within a 60-second window
-        if abs(video_duration - target_duration) <= 60:
-            return None 
+        # 1. ULTRA-STRICT DURATION CHECK
+        # Studio tracks rarely deviate from their official length by more than 4 seconds.
+        # Sped-up, slowed-down, or extended edits will fail this window.
+        if abs(video_duration - target_duration) > 4:
+            return f"Duration mismatch: found {video_duration}s, expected {target_duration}s"
 
-        return f"Duration mismatch: found {video_duration}s, expected {target_duration}s"
+        # 2. BEDROOM-EDIT BLACKLIST
+        # Weed out common SoundCloud alterations unless they are part of the official track details.
+        title = (info.get('title') or '').lower()
+        orig_name_lower = track_name.lower()
+        orig_artist_lower = track_artist.lower()
+
+        blacklist_terms = [
+            "sped up", "slowed", "reverb", "nightcore", "cover", "remix", 
+            "instrumental", "karaoke", "tribute", "mashup", "pitch", "edit", "8d"
+        ]
+        
+        for term in blacklist_terms:
+            # If the term is found in SoundCloud's title but is NOT in the official title/artist, block it.
+            if term in title and term not in orig_name_lower and term not in orig_artist_lower:
+                return f"Unauthentic version detected (contains '{term}')"
+
+        return None
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -206,7 +225,7 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True,  # Bypasses DRM blocks and continues searching
+        'ignoreerrors': True,  # Bypasses blocked files to keep scanning down the search list
     }
 
     try:
@@ -214,21 +233,20 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
             ydl.download([search_query])
             
     except Exception as e:
-        # Handles the "max downloads reached" error (which is actually a success)
         if os.path.exists(output_filename):
             pass 
         else:
             log.error("Failed to generate preview for %s: %s", track_id, e)
             err_msg = str(e).replace("ERROR: ", "")
             
-            if "Duration mismatch" in err_msg:
-                return {"url": None, "error": "No results matched the track length."}
+            if "Duration mismatch" in err_msg or "Unauthentic version" in err_msg:
+                return {"url": None, "error": "No results matched the official studio master."}
                 
             return {"url": None, "error": err_msg}
 
     # Final verification
     if not os.path.exists(output_filename):
-        return {"url": None, "error": "No valid, unlocked SoundCloud match found."}
+        return {"url": None, "error": "No valid, authentic studio matches found."}
 
     return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
