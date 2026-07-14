@@ -126,7 +126,8 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
     if os.path.exists(output_filename):
         return f"/api/previews/{track_id}.mp3"
 
-    search_query = f"ytsearch1:{track_name} {track_artist} official audio"
+    # Switched to specifically ask for the full song to avoid short promotional clips
+    search_query = f"ytsearch1:{track_name} {track_artist} full song official audio"
     try:
         # 1. Get the direct audio URL from YouTube without downloading
         ytdlp_cmd = ["yt-dlp", "-f", "bestaudio", "-g", search_query]
@@ -147,8 +148,9 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str) -
 
 def fetch_track_extra(track: dict) -> dict:
     """
-    Fetches duration and preview-clip URL. If Spotify's URL is missing/broken,
-    it falls back to rendering our own full clip via YouTube/ffmpeg.
+    Fetches duration. We explicitly bypass Spotify's native preview URL because
+    it forces a short 15-30 second snippet, and instead immediately trigger our 
+    own full clip download via YouTube/ffmpeg.
     """
     track_id = track.get("id")
     track_name = track.get("name", "")
@@ -163,12 +165,12 @@ def fetch_track_extra(track: dict) -> dict:
         if data:
             entity = data["props"]["pageProps"]["state"]["data"]["entity"]
             duration_ms = entity.get("duration")
-            preview_url = (entity.get("audioPreview") or {}).get("url")
+            # Intentionally ignoring `audioPreview` from Spotify to avoid 15s clips
     except Exception:
         log.exception("Failed to fetch track extra for %s", track_id)
 
-    # Fallback to generating a custom full render if Spotify gives us nothing
-    if not preview_url and track_name and artist_name:
+    # Always generate a custom full render from YouTube
+    if track_name and artist_name:
         preview_url = generate_custom_preview(track_name, artist_name, track_id)
 
     return {"duration_ms": duration_ms, "preview_url": preview_url}
@@ -176,9 +178,8 @@ def fetch_track_extra(track: dict) -> dict:
 
 def enrich_tracks_with_previews(tracks: list, max_workers: int = PREVIEW_FETCH_WORKERS) -> list:
     """
-    Concurrently fetches duration + preview URL for each track and merges the
-    results back in. Caps how many tracks get enriched (see MAX_PREVIEW_ENRICH)
-    to keep response times reasonable on large playlists.
+    Concurrently fetches duration + full audio track for each item. Caps how many 
+    tracks get enriched (see MAX_PREVIEW_ENRICH) to keep response times reasonable.
     """
     to_enrich = [t for t in tracks if t.get("id")][:MAX_PREVIEW_ENRICH]
     results = {}
