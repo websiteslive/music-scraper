@@ -199,24 +199,35 @@ def generate_custom_preview(track_name: str, track_artist: str, track_id: str, d
             'preferredquality': '320',
         }],
         'match_filter': match_filter,
-        'max_downloads': 1, # Stop downloading immediately once 1 search result passes the filter
+        'max_downloads': 1, 
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
+        'ignoreerrors': True,  # <-- NEW: Tells yt-dlp to bypass DRM blocks and check the next result
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([search_query])
-
-        if not os.path.exists(output_filename):
-            return {"url": None, "error": "No SoundCloud match found within the allowed track duration."}
-
-        return {"url": f"/api/previews/{track_id}.mp3", "error": None}
-
+            
     except Exception as e:
-        log.error("Failed to generate preview for %s: %s", track_id, e)
-        return {"url": None, "error": str(e)}
+        # <-- NEW: Handles the fake "max downloads reached" error
+        if os.path.exists(output_filename):
+            pass 
+        else:
+            log.error("Failed to generate preview for %s: %s", track_id, e)
+            err_msg = str(e).replace("ERROR: ", "")
+            
+            if "Duration mismatch" in err_msg:
+                return {"url": None, "error": "No results matched the exact Spotify track length."}
+                
+            return {"url": None, "error": err_msg}
+
+    # Final verification
+    if not os.path.exists(output_filename):
+        return {"url": None, "error": "No valid, unlocked SoundCloud match found."}
+
+    return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
 
 def save_cover_webp(track_id: str, cover_url: str) -> dict:
@@ -284,7 +295,7 @@ def api_track_media(track_id):
     name = (data.get("name") or "").strip()
     artist = (data.get("artists") or "").strip()
     cover_url = data.get("cover_url")
-    duration_ms = data.get("duration_ms") # Captured from Spotify metadata pass
+    duration_ms = data.get("duration_ms")
 
     result = {"preview_url": None, "preview_error": None, "cover_url": None, "cover_error": None}
 
