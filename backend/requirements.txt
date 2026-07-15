@@ -1,6 +1,4 @@
-flask==3.0.3
-flask-cors==4.0.1
-requests==2.32.3
-yt-dlp>=2024.4.9
-Pillow>=10.3.0
-gunicorn==22.0.0
+Flask==3.0.3
+Flask-Cors==5.0.0
+spotdl==4.2.0
+gunicorn==23.0.0
