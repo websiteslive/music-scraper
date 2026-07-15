@@ -3,6 +3,7 @@ from flask_cors import CORS
 import threading
 import subprocess
 import os
+import shutil
 
 app = Flask(__name__)
 CORS(app)
@@ -12,28 +13,26 @@ if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
 
 status = {"count": 0, "running": False}
 
-# Added url parameter here
 def run_downloader(url):
     global status
     status["running"] = True
-    # The actual subprocess now uses the dynamic URL
+    # Run the download
     subprocess.run(["spotdl", "download", url, "--output", DOWNLOAD_DIR, "--format", "mp3"])
+    
+    # Create Zip after success
+    shutil.make_archive('spooled_library', 'zip', DOWNLOAD_DIR)
+    
     status["running"] = False
 
 @app.route('/start', methods=['POST'])
 def start():
-    # Capture the URL from the frontend request
     data = request.get_json()
     url = data.get('url')
+    if not url: return jsonify({"status": "error", "message": "No URL"}), 400
     
-    if not url:
-        return jsonify({"status": "error", "message": "No URL provided"}), 400
-
     if not status["running"]:
-        # Pass the url to the thread
         threading.Thread(target=run_downloader, args=(url,)).start()
         return jsonify({"status": "started"})
-    
     return jsonify({"status": "already_running"})
 
 @app.route('/status', methods=['GET'])
