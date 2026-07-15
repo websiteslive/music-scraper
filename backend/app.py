@@ -36,6 +36,10 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# This used to cap how many tracks got FULL AUDIO generated up front. That's gone —
+# audio is now generated on-demand, one track at a time, via /api/track/<id>/media.
+# This cap only limits the lightweight metadata pass (duration + cover art), which
+# is just a page fetch per track, not a yt-dlp/ffmpeg run.
 MAX_METADATA_ENRICH = 200
 METADATA_FETCH_WORKERS = 6
 
@@ -43,12 +47,12 @@ OUTPUT_DIR = os.path.join(app.root_path, "static", "previews")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def extract_playlist_id(url):
+def extract_playlist_id(url: str) -> str | None:
     m = PLAYLIST_ID_RE.search(url or "")
     return m.group(1) if m else None
 
 
-def _fetch_next_data(url, timeout=15):
+def _fetch_next_data(url: str, timeout: int = 15):
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
     match = NEXT_DATA_RE.search(resp.text) if resp.status_code == 200 else None
     if not match:
@@ -59,7 +63,7 @@ def _fetch_next_data(url, timeout=15):
         return None, resp.status_code, resp.text
 
 
-def _best_cover_url(cover_art):
+def _best_cover_url(cover_art: dict | None) -> str | None:
     """Picks the largest available image from a Spotify coverArt.sources list."""
     if not cover_art:
         return None
@@ -73,7 +77,7 @@ def _best_cover_url(cover_art):
     return best.get("url")
 
 
-def scrape_playlist(playlist_id, debug=False):
+def scrape_playlist(playlist_id: str, debug: bool = False):
     url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
     debug_info = None
 
@@ -119,7 +123,7 @@ def scrape_playlist(playlist_id, debug=False):
     return playlist_name, tracks, debug_info
 
 
-def fetch_track_metadata(track):
+def fetch_track_metadata(track: dict) -> dict:
     """Lightweight per-track fetch: duration + fallback cover art. No yt-dlp/ffmpeg."""
     track_id = track.get("id")
     url = f"https://open.spotify.com/embed/track/{track_id}"
@@ -140,7 +144,7 @@ def fetch_track_metadata(track):
     return {"duration_ms": duration_ms, "cover_url": cover_url}
 
 
-def enrich_tracks_with_metadata(tracks, max_workers=METADATA_FETCH_WORKERS):
+def enrich_tracks_with_metadata(tracks: list, max_workers: int = METADATA_FETCH_WORKERS) -> list:
     to_enrich = [t for t in tracks if t.get("id")][:MAX_METADATA_ENRICH]
     results = {}
 
@@ -162,10 +166,9 @@ def enrich_tracks_with_metadata(tracks, max_workers=METADATA_FETCH_WORKERS):
     return tracks
 
 
-def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
+def find_best_youtube_match(track_name: str, track_artist: str, target_duration_ms: int = None) -> str | None:
     """
     Searches YouTube for candidate tracks, evaluating and grading up to 10 results.
-    Prioritizes official label releases ("Topic" channels), exact durations, and official audio tags.
     """
     search_query = f"ytsearch10:{track_name} {track_artist}"
     
@@ -180,6 +183,11 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
         'no_warnings': True,
     }
 
+    # Dynamically inject the cookies file if uploaded by the user
+    cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             results = ydl.extract_info(search_query, download=False)
@@ -193,7 +201,6 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
 
     scored_entries = []
     
-    # Precise regex word-boundary filters to avoid false-positives
     blacklist_patterns = [
         r"\bsped\s+up\b", r"\bslowed\b", r"\breverb\b", r"\bnightcore\b", 
         r"\bcover\b", r"\bremix\b", r"\binstrumental\b", r"\bkaraoke\b", 
@@ -224,10 +231,8 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
         score = 0
         disqualified = False
 
-        # 1. BANNED WORD CHECK (with boundaries)
         for pattern in blacklist_patterns:
             if re.search(pattern, title):
-                # Only disqualify if the banned word is NOT in the official Spotify track name or artist
                 if not re.search(pattern, orig_name_lower) and not re.search(pattern, orig_artist_lower):
                     disqualified = True
                     break
@@ -235,13 +240,11 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
         if disqualified:
             continue
 
-        # 2. DURATION SCORING (Matches must match the official studio runtime closely)
         if target_duration and video_duration:
             diff = abs(video_duration - target_duration)
-            if diff > 15:  # Cutoff: Studio tracks should rarely be more than 15s off
+            if diff > 15:
                 continue
             
-            # Tiered scoring for duration proximity
             if diff <= 3:
                 score += 80
             elif diff <= 6:
@@ -251,11 +254,9 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
             else:
                 score -= 10
         else:
-            # If Spotify metadata lacks duration, weed out extreme outliers (e.g., loops or shorts)
             if video_duration and (video_duration > 600 or video_duration < 30):
                 continue
 
-        # 3. CHANNEL CHECKS (Topic channels & Official Artist Channels are the highest fidelity)
         if uploader.endswith(" - topic"):
             score += 100
         elif orig_artist_lower in uploader:
@@ -263,7 +264,6 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
         elif "vevo" in uploader:
             score += 35
 
-        # 4. TITLE CONTEXT CHECKS
         if "official audio" in title:
             score += 30
         elif "official lyric" in title:
@@ -285,7 +285,6 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
     if not scored_entries:
         return None
 
-    # Sort results by score descending, pick the absolute best
     scored_entries.sort(key=lambda x: x['score'], reverse=True)
     winner = scored_entries[0]
     
@@ -295,7 +294,7 @@ def find_best_youtube_match(track_name, track_artist, target_duration_ms=None):
     return winner['url']
 
 
-def generate_custom_preview(track_name, track_artist, track_id, duration_ms=None):
+def generate_custom_preview(track_name: str, track_artist: str, track_id: str, duration_ms: int = None) -> dict:
     """
     Finds the absolute best studio-master match on YouTube and downloads it as high-quality MP3.
     """
@@ -306,12 +305,10 @@ def generate_custom_preview(track_name, track_artist, track_id, duration_ms=None
     if os.path.exists(output_filename):
         return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
-    # Find the absolute best target URL
     best_url = find_best_youtube_match(track_name, track_artist, duration_ms)
     if not best_url:
         return {"url": None, "error": "No valid, authentic studio matches found on YouTube."}
 
-    # Download the winner
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': output_template,
@@ -326,6 +323,14 @@ def generate_custom_preview(track_name, track_artist, track_id, duration_ms=None
         'no_warnings': True,
     }
 
+    # Apply the uploaded cookie file if it exists in the backend workspace
+    cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+        log.info("Using cookies.txt for yt-dlp download authentication.")
+    else:
+        log.warning("cookies.txt not found. Running without authenticated session.")
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([best_url])
@@ -337,14 +342,13 @@ def generate_custom_preview(track_name, track_artist, track_id, duration_ms=None
             log.error("Failed to download YouTube master for %s: %s", track_id, e)
             return {"url": None, "error": str(e).replace("ERROR: ", "")}
 
-    # Final verification
     if not os.path.exists(output_filename):
         return {"url": None, "error": "Audio conversion failed."}
 
     return {"url": f"/api/previews/{track_id}.mp3", "error": None}
 
 
-def save_cover_webp(track_id, cover_url):
+def save_cover_webp(track_id: str, cover_url: str) -> dict:
     """Downloads a track's cover art and saves it as a .webp for the spooler zip."""
     output_filename = os.path.join(OUTPUT_DIR, f"{track_id}_cover.webp")
 
@@ -363,6 +367,29 @@ def save_cover_webp(track_id, cover_url):
     except Exception as e:
         log.error("Failed to save cover art for %s: %s", track_id, e)
         return {"url": None, "error": str(e)}
+
+
+@app.route("/api/upload-cookies", methods=["POST"])
+def upload_cookies():
+    """Endpoint allowing users to upload their own cookies.txt dynamically."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in the request."}), 400
+        
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected."}), 400
+
+    if file and file.filename.endswith('.txt'):
+        try:
+            cookies_path = os.path.join(os.path.dirname(__file__), "cookies.txt")
+            file.save(cookies_path)
+            log.info("A new cookies.txt file was successfully uploaded by user.")
+            return jsonify({"status": "success", "message": "cookies.txt uploaded successfully!"})
+        except Exception as e:
+            log.exception("Failed to write uploaded cookies.txt file")
+            return jsonify({"error": f"Failed to save file: {e}"}), 500
+    else:
+        return jsonify({"error": "Invalid file type. Please upload a plain .txt cookies file."}), 400
 
 
 @app.route("/api/tracks", methods=["POST"])
@@ -395,7 +422,7 @@ def api_tracks():
             payload["debug"] = debug_info
         return jsonify(payload), 404
 
-    # Fast pass only: duration + cover art. No audio generation here.
+    # Fast pass only: duration + cover art. No audio generation here anymore.
     tracks = enrich_tracks_with_metadata(tracks)
 
     response = {"playlist_name": name or "Tracklist", "count": len(tracks), "tracks": tracks}
